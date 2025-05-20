@@ -24,4 +24,3 @@ go.work
 *.iml
 
 /reverse_proxy
-/reverse_proxy_configuration.go

@@ -1,14 +1,16 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
-	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"github.com/Motmedel/ecs_go/ecs"
 	motmedelEnv "github.com/Motmedel/utils_go/pkg/env"
 	motmedelErrors "github.com/Motmedel/utils_go/pkg/errors"
+	motmedelHttpLog "github.com/Motmedel/utils_go/pkg/http/log"
 	motmedelMux "github.com/Motmedel/utils_go/pkg/http/mux"
 	motmedelLog "github.com/Motmedel/utils_go/pkg/log"
 	motmedelErrorLogger "github.com/Motmedel/utils_go/pkg/log/error_logger"
@@ -21,11 +23,9 @@ import (
 )
 
 type UpstreamConfiguration struct {
-	Url                     string
-	UseClientAuthentication bool
+	Url                     string `json:"url,omitempty"`
+	UseClientAuthentication bool   `json:"use_client_authentication,omitempty"`
 }
-
-var hostToUpstreamConfiguration map[string]*UpstreamConfiguration
 
 var (
 	ErrNilClientHelloInfo       = errors.New("nil client hello info")
@@ -36,9 +36,64 @@ var (
 	ErrEmptyCertificateData     = errors.New("empty certificate data")
 	ErrEmptyServerAddress       = errors.New("empty server address")
 	ErrEmptyKeyData             = errors.New("empty key data")
+	ErrEmptyConfigFilePath      = errors.New("empty config file path")
+	ErrNilConfig                = errors.New("nil config")
 )
 
+type CliConfig struct {
+	ServerAddress       string
+	CertificateFilePath string
+	KeyFilePath         string
+	ConfigFilePath      string
+	Verbose             bool
+}
+
+func parseFlags() *CliConfig {
+	config := &CliConfig{}
+
+	flag.StringVar(
+		&config.ServerAddress,
+		"addr",
+		motmedelEnv.GetEnvWithDefault("SERVER_ADDRESS", ":443"),
+		"HTTP server address",
+	)
+
+	flag.StringVar(
+		&config.CertificateFilePath,
+		"cert",
+		motmedelEnv.GetEnvWithDefault("CERTIFICATE_FILE_PATH", ""),
+		"Path to TLS certificate file",
+	)
+
+	flag.StringVar(
+		&config.KeyFilePath,
+		"key",
+		motmedelEnv.GetEnvWithDefault("CERTIFICATE_KEY_PATH", ""),
+		"Path to TLS key file",
+	)
+
+	flag.StringVar(
+		&config.ConfigFilePath,
+		"config",
+		motmedelEnv.GetEnvWithDefault("CONFIG_PATH", "/etc/reverse_proxy/config.json"),
+		"Path to the configuration file",
+	)
+
+	flag.BoolVar(
+		&config.Verbose,
+		"verbose",
+		false,
+		"Enable verbose (debug-level) logging",
+	)
+
+	flag.Parse()
+
+	return config
+}
+
 func main() {
+	var logLevel slog.LevelVar
+
 	logger := &motmedelErrorLogger.Logger{
 		Logger: slog.New(
 			&motmedelLog.ContextHandler{
@@ -46,44 +101,30 @@ func main() {
 					os.Stdout,
 					&slog.HandlerOptions{
 						AddSource:   false,
-						Level:       slog.LevelInfo,
+						Level:       &logLevel,
 						ReplaceAttr: ecs.TimestampReplaceAttr,
 					},
 				),
 				Extractors: []motmedelLog.ContextExtractor{
 					&motmedelLog.ErrorContextExtractor{},
+					&motmedelHttpLog.HttpContextExtractor{},
 				},
 			},
 		).With(slog.Group("event", slog.String("dataset", "reverse_proxy"))),
 	}
 	slog.SetDefault(logger.Logger)
 
-	var serverAddress string
-	flag.StringVar(
-		&serverAddress,
-		"addr",
-		motmedelEnv.GetEnvWithDefault("SERVER_ADDRESS", ":443"),
-		"HTTP server address",
-	)
+	config := parseFlags()
+	if config == nil {
+		logger.FatalWithExitingMessage("Empty configuration.", motmedelErrors.NewWithTrace(ErrNilConfig))
+	}
 
-	var certificateFilePath string
-	flag.StringVar(
-		&certificateFilePath,
-		"cert",
-		motmedelEnv.GetEnvWithDefault("CERTIFICATE_FILE_PATH", ""),
-		"Path to TLS certificate file",
-	)
+	verbose := config.Verbose
+	if verbose {
+		logLevel.Set(slog.LevelDebug)
+	}
 
-	var keyFilePath string
-	flag.StringVar(
-		&keyFilePath,
-		"key",
-		motmedelEnv.GetEnvWithDefault("CERTIFICATE_KEY_PATH", ""),
-		"Path to TLS key file",
-	)
-
-	flag.Parse()
-
+	serverAddress := config.ServerAddress
 	if serverAddress == "" {
 		logger.FatalWithExitingMessage(
 			"Empty server address.",
@@ -91,6 +132,7 @@ func main() {
 		)
 	}
 
+	certificateFilePath := config.CertificateFilePath
 	if certificateFilePath == "" {
 		logger.FatalWithExitingMessage(
 			"Empty certificate file path.",
@@ -98,12 +140,46 @@ func main() {
 		)
 	}
 
+	keyFilePath := config.KeyFilePath
 	if keyFilePath == "" {
 		logger.FatalWithExitingMessage(
 			"Empty key file path.",
 			motmedelErrors.NewWithTrace(ErrEmptyKeyFilePath),
 		)
 	}
+
+	configFilePath := config.ConfigFilePath
+	if configFilePath == "" {
+		logger.FatalWithExitingMessage(
+			"Empty config path.",
+			motmedelErrors.NewWithTrace(ErrEmptyConfigFilePath),
+		)
+	}
+
+	// Read the configuration file.
+
+	configData, err := os.ReadFile(configFilePath)
+	if err != nil {
+		logger.FatalWithExitingMessage(
+			"An error occurred when reading the configuration file.",
+			motmedelErrors.NewWithTrace(fmt.Errorf("os read file (config): %w", err)),
+			configFilePath,
+		)
+	}
+
+	var hostToUpstreamConfiguration map[string]*UpstreamConfiguration
+	if err := json.Unmarshal(configData, &hostToUpstreamConfiguration); err != nil {
+		logger.FatalWithExitingMessage(
+			"An error occurred when decoding the configuration file.",
+			motmedelErrors.NewWithTrace(fmt.Errorf("json unmarshal (config): %w", err)),
+			configData,
+		)
+	}
+	if len(hostToUpstreamConfiguration) == 0 {
+		logger.Warn("The host to upstream configuration is empty.")
+	}
+
+	// Read the certificate material.
 
 	certificateData, err := os.ReadFile(certificateFilePath)
 	if err != nil {
@@ -141,16 +217,7 @@ func main() {
 		)
 	}
 
-	certificatePool := x509.NewCertPool()
-	certificateDerBlockBytes := certificate.Certificate[0]
-	x509Certificate, err := x509.ParseCertificate(certificateDerBlockBytes)
-	if err != nil {
-		logger.FatalWithExitingMessage(
-			"An error occurred when parsing a certificate DER block bytes as a x509 certificate.",
-			motmedelErrors.NewWithTrace(fmt.Errorf("x509 parse certificate: %w", err)),
-		)
-	}
-	certificatePool.AddCert(x509Certificate)
+	// Make the Vhost mux configuration.
 
 	hostToSpecification := make(map[string]*motmedelMux.VhostMuxSpecification)
 
@@ -185,11 +252,16 @@ func main() {
 	}
 
 	vhostMux := &motmedelMux.VhostMux{HostToSpecification: hostToSpecification}
+	if verbose {
+		vhostMux.DoneCallback = func(ctx context.Context) {
+			slog.DebugContext(ctx, "An HTTP response was served.")
+		}
+	}
 
 	srv := &http.Server{
 		Addr:         serverAddress,
 		Handler:      vhostMux,
-		ReadTimeout:  15 * time.Second,
+		ReadTimeout:  3 * time.Minute,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 		TLSConfig: &tls.Config{
@@ -200,7 +272,7 @@ func main() {
 
 				cfg, ok := hostToUpstreamConfiguration[clientHelloInfo.ServerName]
 				if !ok {
-					// Fail the TLS handshake.
+					// Fail the TLS handshake when there is no matching configuration for the server name.
 					return nil, nil
 				}
 
@@ -212,7 +284,7 @@ func main() {
 
 				if cfg.UseClientAuthentication {
 					tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-					tlsConfig.ClientCAs = certificatePool
+					// TODO: I cannot make "CA pinning" work... Something for future?
 				}
 
 				return tlsConfig, nil

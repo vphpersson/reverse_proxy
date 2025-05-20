@@ -12,6 +12,7 @@ require (
 
 require (
 	github.com/Motmedel/parsing_utils v0.0.3 // indirect
+	github.com/Motmedel/utils_go/pkg/http/log v0.0.4 // indirect
 	github.com/Motmedel/utils_go/pkg/http/parsing/headers v0.0.22 // indirect
 	github.com/Motmedel/utils_go/pkg/http/problem_detail v1.0.4 // indirect
 	github.com/Motmedel/utils_go/pkg/net/domain_breakdown v0.0.4 // indirect
