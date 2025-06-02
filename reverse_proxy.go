@@ -25,6 +25,7 @@ import (
 type UpstreamConfiguration struct {
 	Url                     string `json:"url,omitempty"`
 	UseClientAuthentication bool   `json:"use_client_authentication,omitempty"`
+	Redirect                bool   `json:"redirect,omitempty"`
 }
 
 var (
@@ -246,9 +247,15 @@ func main() {
 			)
 		}
 
-		hostToSpecification[host] = &motmedelMux.VhostMuxSpecification{
-			Mux: httputil.NewSingleHostReverseProxy(target),
+		var specification *motmedelMux.VhostMuxSpecification
+
+		if upstreamConfiguration.Redirect {
+			specification = &motmedelMux.VhostMuxSpecification{RedirectTo: upstreamUrl}
+		} else {
+			specification = &motmedelMux.VhostMuxSpecification{Mux: httputil.NewSingleHostReverseProxy(target)}
 		}
+
+		hostToSpecification[host] = specification
 	}
 
 	vhostMux := &motmedelMux.VhostMux{HostToSpecification: hostToSpecification}
@@ -258,7 +265,7 @@ func main() {
 		}
 	}
 
-	srv := &http.Server{
+	server := &http.Server{
 		Addr:         serverAddress,
 		Handler:      vhostMux,
 		ReadTimeout:  3 * time.Minute,
@@ -292,7 +299,7 @@ func main() {
 		},
 	}
 
-	if err := srv.ListenAndServeTLS("", ""); err != nil {
+	if err := server.ListenAndServeTLS("", ""); err != nil {
 		logger.FatalWithExitingMessage(
 			"An error occurred when listening and serving.",
 			motmedelErrors.NewWithTrace(fmt.Errorf("http listen and serve: %w", err)),
