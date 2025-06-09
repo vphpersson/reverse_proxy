@@ -19,7 +19,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"time"
 )
 
 type UpstreamConfiguration struct {
@@ -266,11 +265,8 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:         serverAddress,
-		Handler:      vhostMux,
-		ReadTimeout:  3 * time.Minute,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:    serverAddress,
+		Handler: vhostMux,
 		TLSConfig: &tls.Config{
 			GetConfigForClient: func(clientHelloInfo *tls.ClientHelloInfo) (*tls.Config, error) {
 				if clientHelloInfo == nil {
