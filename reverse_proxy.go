@@ -10,11 +10,13 @@ import (
 	"github.com/Motmedel/ecs_go/ecs"
 	motmedelEnv "github.com/Motmedel/utils_go/pkg/env"
 	motmedelErrors "github.com/Motmedel/utils_go/pkg/errors"
+	motmedelHttpErrors "github.com/Motmedel/utils_go/pkg/http/errors"
 	motmedelHttpLog "github.com/Motmedel/utils_go/pkg/http/log"
 	motmedelMux "github.com/Motmedel/utils_go/pkg/http/mux"
 	motmedelLog "github.com/Motmedel/utils_go/pkg/log"
 	motmedelErrorLogger "github.com/Motmedel/utils_go/pkg/log/error_logger"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -251,7 +253,56 @@ func main() {
 		if upstreamConfiguration.Redirect {
 			specification = &motmedelMux.VhostMuxSpecification{RedirectTo: upstreamUrl}
 		} else {
-			specification = &motmedelMux.VhostMuxSpecification{Mux: httputil.NewSingleHostReverseProxy(target)}
+			proxy := httputil.NewSingleHostReverseProxy(target)
+
+			originalDirector := proxy.Director
+			proxy.Director = func(request *http.Request) {
+				if request == nil {
+					logger.Error(
+						"Empty HTTP request.",
+						motmedelErrors.NewWithTrace(motmedelHttpErrors.ErrNilHttpRequest),
+					)
+					return
+				}
+
+				originalDirector(request)
+
+				proto := "http"
+				if request.TLS != nil {
+					proto = "https"
+				}
+
+				clientIp, _, err := net.SplitHostPort(request.RemoteAddr)
+				if err != nil {
+					clientIp = request.RemoteAddr
+				}
+
+				requestHeader := request.Header
+				if requestHeader == nil {
+					logger.Error(
+						"Empty HTTP request header.",
+						motmedelErrors.NewWithTrace(motmedelHttpErrors.ErrNilHttpRequestHeader),
+					)
+					return
+				}
+
+				requestHost := request.Host
+
+				forwardedString := fmt.Sprintf("for=%s;proto=%s", clientIp, proto)
+				if requestHost != "" {
+					forwardedString += fmt.Sprintf(";host=%s", requestHost)
+				}
+
+				requestHeader.Set("Forwarded", forwardedString)
+				requestHeader.Set("X-Forwarded-For", clientIp)
+				requestHeader.Set("X-Forwarded-Proto", proto)
+
+				if requestHost != "" {
+					requestHeader.Set("X-Forwarded-Host", requestHost)
+				}
+			}
+
+			specification = &motmedelMux.VhostMuxSpecification{Mux: proxy}
 		}
 
 		hostToSpecification[host] = specification
