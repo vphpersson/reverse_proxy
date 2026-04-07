@@ -4,23 +4,25 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"github.com/Motmedel/ecs_go/ecs"
-	motmedelEnv "github.com/Motmedel/utils_go/pkg/env"
-	motmedelErrors "github.com/Motmedel/utils_go/pkg/errors"
-	motmedelHttpErrors "github.com/Motmedel/utils_go/pkg/http/errors"
-	motmedelHttpLog "github.com/Motmedel/utils_go/pkg/http/log"
-	motmedelMux "github.com/Motmedel/utils_go/pkg/http/mux"
-	motmedelLog "github.com/Motmedel/utils_go/pkg/log"
-	motmedelErrorLogger "github.com/Motmedel/utils_go/pkg/log/error_logger"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+
+	motmedelEnv "github.com/Motmedel/utils_go/pkg/env"
+	motmedelErrors "github.com/Motmedel/utils_go/pkg/errors"
+	"github.com/Motmedel/utils_go/pkg/errors/types/empty_error"
+	"github.com/Motmedel/utils_go/pkg/errors/types/nil_error"
+	motmedelHttpErrors "github.com/Motmedel/utils_go/pkg/http/errors"
+	motmedelMux "github.com/Motmedel/utils_go/pkg/http/mux"
+	"github.com/Motmedel/utils_go/pkg/http/types/http_context_extractor"
+	motmedelLog "github.com/Motmedel/utils_go/pkg/log"
+	motmedelErrorLogger "github.com/Motmedel/utils_go/pkg/log/error_logger"
+	schemaLog "github.com/Motmedel/utils_go/pkg/schema/log"
 )
 
 type UpstreamConfiguration struct {
@@ -29,18 +31,43 @@ type UpstreamConfiguration struct {
 	Redirect                bool   `json:"redirect,omitempty"`
 }
 
-var (
-	ErrNilClientHelloInfo       = errors.New("nil client hello info")
-	ErrNilUpstreamConfiguration = errors.New("nil upstream configuration")
-	ErrEmptyUpstreamUrl         = errors.New("empty upstream url")
-	ErrEmptyCertificateFilePath = errors.New("empty certificate file path")
-	ErrEmptyKeyFilePath         = errors.New("empty key file path")
-	ErrEmptyCertificateData     = errors.New("empty certificate data")
-	ErrEmptyServerAddress       = errors.New("empty server address")
-	ErrEmptyKeyData             = errors.New("empty key data")
-	ErrEmptyConfigFilePath      = errors.New("empty config file path")
-	ErrNilConfig                = errors.New("nil config")
-)
+// setForwardedHeaders populates the Forwarded (RFC 7239) and X-Forwarded-*
+// headers on request based on its RemoteAddr, Host and TLS state. The caller
+// must ensure that request and request.Header are non-nil.
+func setForwardedHeaders(request *http.Request) {
+	proto := "http"
+	if request.TLS != nil {
+		proto = "https"
+	}
+
+	clientIp, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err != nil {
+		clientIp = request.RemoteAddr
+	}
+
+	requestHost := request.Host
+
+	// Per RFC 7239, IPv6 addresses in the Forwarded header must be bracketed
+	// and quoted (e.g. for="[2001:db8::1]").
+	forwardedFor := clientIp
+	if ip := net.ParseIP(clientIp); ip != nil && ip.To4() == nil {
+		forwardedFor = fmt.Sprintf("%q", "["+clientIp+"]")
+	}
+
+	forwardedString := fmt.Sprintf("for=%s;proto=%s", forwardedFor, proto)
+	if requestHost != "" {
+		forwardedString += fmt.Sprintf(";host=%s", requestHost)
+	}
+
+	requestHeader := request.Header
+	requestHeader.Set("Forwarded", forwardedString)
+	requestHeader.Set("X-Forwarded-For", clientIp)
+	requestHeader.Set("X-Forwarded-Proto", proto)
+
+	if requestHost != "" {
+		requestHeader.Set("X-Forwarded-Host", requestHost)
+	}
+}
 
 type CliConfig struct {
 	ServerAddress       string
@@ -104,12 +131,12 @@ func main() {
 					&slog.HandlerOptions{
 						AddSource:   false,
 						Level:       &logLevel,
-						ReplaceAttr: ecs.TimestampReplaceAttr,
+						ReplaceAttr: schemaLog.ReplaceAttr,
 					},
 				),
 				Extractors: []motmedelLog.ContextExtractor{
 					&motmedelLog.ErrorContextExtractor{},
-					&motmedelHttpLog.HttpContextExtractor{},
+					&http_context_extractor.Extractor{},
 				},
 			},
 		).With(slog.Group("event", slog.String("dataset", "reverse_proxy"))),
@@ -117,9 +144,6 @@ func main() {
 	slog.SetDefault(logger.Logger)
 
 	config := parseFlags()
-	if config == nil {
-		logger.FatalWithExitingMessage("Empty configuration.", motmedelErrors.NewWithTrace(ErrNilConfig))
-	}
 
 	verbose := config.Verbose
 	if verbose {
@@ -130,7 +154,7 @@ func main() {
 	if serverAddress == "" {
 		logger.FatalWithExitingMessage(
 			"Empty server address.",
-			motmedelErrors.NewWithTrace(ErrEmptyServerAddress),
+			motmedelErrors.NewWithTrace(empty_error.New("server address")),
 		)
 	}
 
@@ -138,7 +162,7 @@ func main() {
 	if certificateFilePath == "" {
 		logger.FatalWithExitingMessage(
 			"Empty certificate file path.",
-			motmedelErrors.NewWithTrace(ErrEmptyCertificateFilePath),
+			motmedelErrors.NewWithTrace(empty_error.New("certificate file path")),
 		)
 	}
 
@@ -146,7 +170,7 @@ func main() {
 	if keyFilePath == "" {
 		logger.FatalWithExitingMessage(
 			"Empty key file path.",
-			motmedelErrors.NewWithTrace(ErrEmptyKeyFilePath),
+			motmedelErrors.NewWithTrace(empty_error.New("key file path")),
 		)
 	}
 
@@ -154,7 +178,7 @@ func main() {
 	if configFilePath == "" {
 		logger.FatalWithExitingMessage(
 			"Empty config path.",
-			motmedelErrors.NewWithTrace(ErrEmptyConfigFilePath),
+			motmedelErrors.NewWithTrace(empty_error.New("config file path")),
 		)
 	}
 
@@ -193,21 +217,21 @@ func main() {
 	if len(certificateData) == 0 {
 		logger.FatalWithExitingMessage(
 			"Empty certificate data.",
-			motmedelErrors.NewWithTrace(ErrEmptyCertificateData),
+			motmedelErrors.NewWithTrace(empty_error.New("certificate data")),
 		)
 	}
 
 	keyData, err := os.ReadFile(keyFilePath)
 	if err != nil {
 		logger.FatalWithExitingMessage(
-			"An error occurred when reading the certificate file.",
-			motmedelErrors.NewWithTrace(fmt.Errorf("os read file (key): %w", err), certificateFilePath),
+			"An error occurred when reading the key file.",
+			motmedelErrors.NewWithTrace(fmt.Errorf("os read file (key): %w", err), keyFilePath),
 		)
 	}
 	if len(keyData) == 0 {
 		logger.FatalWithExitingMessage(
 			"Empty key data.",
-			motmedelErrors.NewWithTrace(ErrEmptyKeyData),
+			motmedelErrors.NewWithTrace(empty_error.New("key data")),
 		)
 	}
 
@@ -227,7 +251,7 @@ func main() {
 		if upstreamConfiguration == nil {
 			logger.FatalWithExitingMessage(
 				"Empty upstream configuration.",
-				motmedelErrors.NewWithTrace(ErrNilUpstreamConfiguration),
+				motmedelErrors.NewWithTrace(nil_error.New("upstream configuration")),
 			)
 		}
 
@@ -235,7 +259,7 @@ func main() {
 		if upstreamUrl == "" {
 			logger.FatalWithExitingMessage(
 				"Empty upstream URL.",
-				motmedelErrors.NewWithTrace(ErrEmptyUpstreamUrl),
+				motmedelErrors.NewWithTrace(empty_error.New("upstream url")),
 			)
 		}
 
@@ -267,18 +291,7 @@ func main() {
 
 				originalDirector(request)
 
-				proto := "http"
-				if request.TLS != nil {
-					proto = "https"
-				}
-
-				clientIp, _, err := net.SplitHostPort(request.RemoteAddr)
-				if err != nil {
-					clientIp = request.RemoteAddr
-				}
-
-				requestHeader := request.Header
-				if requestHeader == nil {
+				if request.Header == nil {
 					logger.Error(
 						"Empty HTTP request header.",
 						motmedelErrors.NewWithTrace(motmedelHttpErrors.ErrNilHttpRequestHeader),
@@ -286,20 +299,7 @@ func main() {
 					return
 				}
 
-				requestHost := request.Host
-
-				forwardedString := fmt.Sprintf("for=%s;proto=%s", clientIp, proto)
-				if requestHost != "" {
-					forwardedString += fmt.Sprintf(";host=%s", requestHost)
-				}
-
-				requestHeader.Set("Forwarded", forwardedString)
-				requestHeader.Set("X-Forwarded-For", clientIp)
-				requestHeader.Set("X-Forwarded-Proto", proto)
-
-				if requestHost != "" {
-					requestHeader.Set("X-Forwarded-Host", requestHost)
-				}
+				setForwardedHeaders(request)
 			}
 
 			specification = &motmedelMux.VhostMuxSpecification{Mux: proxy}
@@ -321,17 +321,17 @@ func main() {
 		TLSConfig: &tls.Config{
 			GetConfigForClient: func(clientHelloInfo *tls.ClientHelloInfo) (*tls.Config, error) {
 				if clientHelloInfo == nil {
-					return nil, ErrNilClientHelloInfo
+					return nil, motmedelErrors.NewWithTrace(nil_error.New("client hello info"))
 				}
 
 				cfg, ok := hostToUpstreamConfiguration[clientHelloInfo.ServerName]
 				if !ok {
 					// Fail the TLS handshake when there is no matching configuration for the server name.
-					return nil, nil
+					return nil, fmt.Errorf("no upstream configuration for SNI %q", clientHelloInfo.ServerName)
 				}
 
 				if cfg == nil {
-					return nil, motmedelErrors.NewWithTrace(ErrNilUpstreamConfiguration)
+					return nil, motmedelErrors.NewWithTrace(nil_error.New("upstream configuration"))
 				}
 
 				tlsConfig := &tls.Config{Certificates: []tls.Certificate{certificate}}
