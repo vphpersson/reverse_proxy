@@ -1,5 +1,8 @@
 *
+!/.dockerignore
 !/.gitignore
+!/Dockerfile
 !/go.mod
 !/go.sum
+!/Makefile
 !/reverse_proxy.go
