@@ -21,6 +21,7 @@ import (
 	motmedelMux "github.com/Motmedel/utils_go/pkg/http/mux"
 	"github.com/Motmedel/utils_go/pkg/http/types/http_context_extractor"
 	motmedelLog "github.com/Motmedel/utils_go/pkg/log"
+	motmedelContextLogger "github.com/Motmedel/utils_go/pkg/log/context_logger"
 	motmedelErrorLogger "github.com/Motmedel/utils_go/pkg/log/error_logger"
 	schemaLog "github.com/Motmedel/utils_go/pkg/schema/log"
 )
@@ -121,38 +122,47 @@ func parseFlags() *CliConfig {
 }
 
 func main() {
-	var logLevel slog.LevelVar
-
-	logger := &motmedelErrorLogger.Logger{
-		Logger: slog.New(
-			&motmedelLog.ContextHandler{
-				Next: slog.NewJSONHandler(
-					os.Stdout,
-					&slog.HandlerOptions{
-						AddSource:   false,
-						Level:       &logLevel,
-						ReplaceAttr: schemaLog.ReplaceAttr,
-					},
-				),
-				Extractors: []motmedelLog.ContextExtractor{
-					&motmedelLog.ErrorContextExtractor{},
-					&http_context_extractor.Extractor{},
-				},
-			},
-		).With(slog.Group("event", slog.String("dataset", "reverse_proxy"))),
-	}
-	slog.SetDefault(logger.Logger)
-
 	config := parseFlags()
 
-	verbose := config.Verbose
-	if verbose {
-		logLevel.Set(slog.LevelDebug)
+	logLevel := slog.LevelInfo
+	if config.Verbose {
+		logLevel = slog.LevelDebug
+	}
+
+	httpContextExtractor := &http_context_extractor.Extractor{}
+	makeLogger := func(eventAttrs ...any) *motmedelErrorLogger.Logger {
+		return &motmedelErrorLogger.Logger{
+			Logger: motmedelContextLogger.New(
+				slog.NewJSONHandler(
+					os.Stdout,
+					&slog.HandlerOptions{Level: logLevel, ReplaceAttr: schemaLog.ReplaceAttr},
+				),
+				&motmedelLog.ErrorContextExtractor{
+					ContextExtractors: []motmedelLog.ContextExtractor{
+						httpContextExtractor,
+					},
+				},
+				httpContextExtractor,
+			).With(slog.Group("event", eventAttrs...)),
+		}
+	}
+
+	logger := makeLogger(slog.String("dataset", "reverse_proxy"))
+	slog.SetDefault(logger.Logger)
+
+	logFatal := func(reason string, err error, input ...any) {
+		l := makeLogger(slog.String("dataset", "reverse_proxy"), slog.String("reason", reason))
+		l.Fatal(err.Error(), err, input...)
+	}
+
+	logError := func(reason string, err error, input ...any) {
+		l := makeLogger(slog.String("dataset", "reverse_proxy"), slog.String("reason", reason))
+		l.Error(err.Error(), err, input...)
 	}
 
 	serverAddress := config.ServerAddress
 	if serverAddress == "" {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"Empty server address.",
 			motmedelErrors.NewWithTrace(empty_error.New("server address")),
 		)
@@ -160,7 +170,7 @@ func main() {
 
 	certificateFilePath := config.CertificateFilePath
 	if certificateFilePath == "" {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"Empty certificate file path.",
 			motmedelErrors.NewWithTrace(empty_error.New("certificate file path")),
 		)
@@ -168,7 +178,7 @@ func main() {
 
 	keyFilePath := config.KeyFilePath
 	if keyFilePath == "" {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"Empty key file path.",
 			motmedelErrors.NewWithTrace(empty_error.New("key file path")),
 		)
@@ -176,7 +186,7 @@ func main() {
 
 	configFilePath := config.ConfigFilePath
 	if configFilePath == "" {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"Empty config path.",
 			motmedelErrors.NewWithTrace(empty_error.New("config file path")),
 		)
@@ -186,7 +196,7 @@ func main() {
 
 	configData, err := os.ReadFile(configFilePath)
 	if err != nil {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"An error occurred when reading the configuration file.",
 			motmedelErrors.NewWithTrace(fmt.Errorf("os read file (config): %w", err)),
 			configFilePath,
@@ -195,7 +205,7 @@ func main() {
 
 	var hostToUpstreamConfiguration map[string]*UpstreamConfiguration
 	if err := json.Unmarshal(configData, &hostToUpstreamConfiguration); err != nil {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"An error occurred when decoding the configuration file.",
 			motmedelErrors.NewWithTrace(fmt.Errorf("json unmarshal (config): %w", err)),
 			configData,
@@ -209,13 +219,13 @@ func main() {
 
 	certificateData, err := os.ReadFile(certificateFilePath)
 	if err != nil {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"An error occurred when reading the certificate file.",
 			motmedelErrors.NewWithTrace(fmt.Errorf("os read file (certificate): %w", err), certificateFilePath),
 		)
 	}
 	if len(certificateData) == 0 {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"Empty certificate data.",
 			motmedelErrors.NewWithTrace(empty_error.New("certificate data")),
 		)
@@ -223,13 +233,13 @@ func main() {
 
 	keyData, err := os.ReadFile(keyFilePath)
 	if err != nil {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"An error occurred when reading the key file.",
 			motmedelErrors.NewWithTrace(fmt.Errorf("os read file (key): %w", err), keyFilePath),
 		)
 	}
 	if len(keyData) == 0 {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"Empty key data.",
 			motmedelErrors.NewWithTrace(empty_error.New("key data")),
 		)
@@ -237,7 +247,7 @@ func main() {
 
 	certificate, err := tls.X509KeyPair(certificateData, keyData)
 	if err != nil {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"An error occurred when parsing the certificate and key.",
 			motmedelErrors.NewWithTrace(fmt.Errorf("tls x509 key pair: %w", err)),
 		)
@@ -249,7 +259,7 @@ func main() {
 
 	for host, upstreamConfiguration := range hostToUpstreamConfiguration {
 		if upstreamConfiguration == nil {
-			logger.FatalWithExitingMessage(
+			logFatal(
 				"Empty upstream configuration.",
 				motmedelErrors.NewWithTrace(nil_error.New("upstream configuration")),
 			)
@@ -257,7 +267,7 @@ func main() {
 
 		upstreamUrl := upstreamConfiguration.Url
 		if upstreamUrl == "" {
-			logger.FatalWithExitingMessage(
+			logFatal(
 				"Empty upstream URL.",
 				motmedelErrors.NewWithTrace(empty_error.New("upstream url")),
 			)
@@ -265,7 +275,7 @@ func main() {
 
 		target, err := url.Parse(upstreamUrl)
 		if err != nil {
-			logger.FatalWithExitingMessage(
+			logFatal(
 				"An error occurred when parsing an upstream URL.",
 				motmedelErrors.NewWithTrace(fmt.Errorf("url parse: %w", err)),
 				upstreamUrl,
@@ -282,7 +292,7 @@ func main() {
 			originalDirector := proxy.Director
 			proxy.Director = func(request *http.Request) {
 				if request == nil {
-					logger.Error(
+					logError(
 						"Empty HTTP request.",
 						motmedelErrors.NewWithTrace(motmedelHttpErrors.ErrNilHttpRequest),
 					)
@@ -292,7 +302,7 @@ func main() {
 				originalDirector(request)
 
 				if request.Header == nil {
-					logger.Error(
+					logError(
 						"Empty HTTP request header.",
 						motmedelErrors.NewWithTrace(motmedelHttpErrors.ErrNilHttpRequestHeader),
 					)
@@ -302,6 +312,18 @@ func main() {
 				setForwardedHeaders(request)
 			}
 
+			proxyLogger := makeLogger(
+				slog.String("dataset", "reverse_proxy"),
+				slog.String("reason", "A proxy error occurred."),
+			)
+			proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+				proxyLogger.Error(
+					err.Error(),
+					motmedelErrors.NewWithTrace(fmt.Errorf("proxy: %w", err)),
+				)
+				w.WriteHeader(http.StatusBadGateway)
+			}
+
 			specification = &motmedelMux.VhostMuxSpecification{Mux: proxy}
 		}
 
@@ -309,7 +331,7 @@ func main() {
 	}
 
 	vhostMux := &motmedelMux.VhostMux{HostToSpecification: hostToSpecification}
-	if verbose {
+	if config.Verbose {
 		vhostMux.DoneCallback = func(ctx context.Context) {
 			slog.DebugContext(ctx, "An HTTP response was served.")
 		}
@@ -347,7 +369,7 @@ func main() {
 	}
 
 	if err := server.ListenAndServeTLS("", ""); err != nil {
-		logger.FatalWithExitingMessage(
+		logFatal(
 			"An error occurred when listening and serving.",
 			motmedelErrors.NewWithTrace(fmt.Errorf("http listen and serve: %w", err)),
 		)

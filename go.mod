@@ -1,9 +1,9 @@
 module reverse_proxy
 
-go 1.25
+go 1.25.0
 
 require (
-	github.com/Motmedel/utils_go v0.0.457
+	github.com/Motmedel/utils_go v0.0.463
 	github.com/Motmedel/utils_go/pkg/http/mux v0.0.184
 )
 
