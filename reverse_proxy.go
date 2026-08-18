@@ -3,8 +3,9 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
-	"flag"
+	"crypto/x509"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -12,41 +13,63 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"time"
 
-	motmedelEnv "github.com/Motmedel/utils_go/pkg/env"
-	motmedelErrors "github.com/Motmedel/utils_go/pkg/errors"
-	"github.com/Motmedel/utils_go/pkg/errors/types/empty_error"
-	"github.com/Motmedel/utils_go/pkg/errors/types/nil_error"
-	motmedelHttpErrors "github.com/Motmedel/utils_go/pkg/http/errors"
-	motmedelMux "github.com/Motmedel/utils_go/pkg/http/mux"
-	"github.com/Motmedel/utils_go/pkg/http/types/http_context_extractor"
-	motmedelLog "github.com/Motmedel/utils_go/pkg/log"
-	motmedelContextLogger "github.com/Motmedel/utils_go/pkg/log/context_logger"
-	motmedelErrorLogger "github.com/Motmedel/utils_go/pkg/log/error_logger"
-	schemaLog "github.com/Motmedel/utils_go/pkg/schema/log"
+	argumentParser "github.com/altshiftab/utils_go/pkg/cli/argument_parser"
+	argumentParserErrors "github.com/altshiftab/utils_go/pkg/cli/argument_parser/errors"
+	"github.com/altshiftab/utils_go/pkg/cli/argument_parser/option"
+	altshiftEnv "github.com/altshiftab/utils_go/pkg/env"
+	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
+	"github.com/altshiftab/utils_go/pkg/errors/types/empty_error"
+	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
+	altshiftMux "github.com/altshiftab/utils_go/pkg/http/mux"
+	"github.com/altshiftab/utils_go/pkg/http/types/http_context_extractor"
+	altshiftLog "github.com/altshiftab/utils_go/pkg/log"
+	altshiftContextLogger "github.com/altshiftab/utils_go/pkg/log/context_logger"
+	altshiftErrorLogger "github.com/altshiftab/utils_go/pkg/log/error_logger"
+	schemaLog "github.com/altshiftab/utils_go/pkg/schema/log"
+)
+
+const programName = "reverse_proxy"
+
+// errNoUpstreamConfiguration fails the handshake for a server name that is not
+// configured, rather than serving it something it did not ask for.
+var errNoUpstreamConfiguration = errors.New("no upstream configuration for the server name")
+
+const (
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 60 * time.Second
+	idleTimeout       = 120 * time.Second
 )
 
 type UpstreamConfiguration struct {
-	Url                     string `json:"url,omitempty"`
-	UseClientAuthentication bool   `json:"use_client_authentication,omitempty"`
-	Redirect                bool   `json:"redirect,omitempty"`
+	Url                     string `json:"url,omitzero"`
+	UseClientAuthentication bool   `json:"use_client_authentication,omitzero"`
+	// ClientCaFilePath names the PEM bundle a client certificate must chain to.
+	// It is required whenever UseClientAuthentication is set: without it Go
+	// verifies against the system roots, which would accept any certificate
+	// issued by any public authority.
+	ClientCaFilePath string `json:"client_ca_file_path,omitzero"`
+	Redirect         bool   `json:"redirect,omitzero"`
 }
 
 // setForwardedHeaders populates the Forwarded (RFC 7239) and X-Forwarded-*
-// headers on request based on its RemoteAddr, Host and TLS state. The caller
-// must ensure that request and request.Header are non-nil.
-func setForwardedHeaders(request *http.Request) {
+// headers on outbound from what inbound says about the client. They are set
+// rather than appended: this is the first hop, so whatever the client claimed
+// is not to be trusted or carried forward. The caller must ensure that both
+// requests and outbound.Header are non-nil.
+func setForwardedHeaders(outbound *http.Request, inbound *http.Request) {
 	proto := "http"
-	if request.TLS != nil {
+	if inbound.TLS != nil {
 		proto = "https"
 	}
 
-	clientIp, _, err := net.SplitHostPort(request.RemoteAddr)
+	clientIp, _, err := net.SplitHostPort(inbound.RemoteAddr)
 	if err != nil {
-		clientIp = request.RemoteAddr
+		clientIp = inbound.RemoteAddr
 	}
 
-	requestHost := request.Host
+	requestHost := inbound.Host
 
 	// Per RFC 7239, IPv6 addresses in the Forwarded header must be bracketed
 	// and quoted (e.g. for="[2001:db8::1]").
@@ -60,7 +83,7 @@ func setForwardedHeaders(request *http.Request) {
 		forwardedString += fmt.Sprintf(";host=%s", requestHost)
 	}
 
-	requestHeader := request.Header
+	requestHeader := outbound.Header
 	requestHeader.Set("Forwarded", forwardedString)
 	requestHeader.Set("X-Forwarded-For", clientIp)
 	requestHeader.Set("X-Forwarded-Proto", proto)
@@ -78,51 +101,49 @@ type CliConfig struct {
 	Verbose             bool
 }
 
-func parseFlags() *CliConfig {
-	config := &CliConfig{}
+func parseArguments() (*CliConfig, error) {
+	config := &CliConfig{
+		// The environment provides the defaults; an argument overrides one.
+		ServerAddress:       altshiftEnv.GetEnvWithDefault("SERVER_ADDRESS", ":443"),
+		CertificateFilePath: altshiftEnv.GetEnvWithDefault("CERTIFICATE_FILE_PATH", ""),
+		KeyFilePath:         altshiftEnv.GetEnvWithDefault("CERTIFICATE_KEY_PATH", ""),
+		ConfigFilePath:      altshiftEnv.GetEnvWithDefault("CONFIG_PATH", "/etc/reverse_proxy/config.json"),
+	}
 
-	flag.StringVar(
-		&config.ServerAddress,
-		"addr",
-		motmedelEnv.GetEnvWithDefault("SERVER_ADDRESS", ":443"),
-		"HTTP server address",
-	)
+	parser := &argumentParser.Parser{
+		ProgramName: programName,
+		Description: "Serve configured hosts over TLS, proxying or redirecting each to its upstream.",
+		Options: []option.Option{
+			option.NewStringOption('a', "addr", "The address to serve on.", false, &config.ServerAddress),
+			option.NewStringOption('c', "cert", "Path to the TLS certificate file.", false, &config.CertificateFilePath),
+			option.NewStringOption('k', "key", "Path to the TLS key file.", false, &config.KeyFilePath),
+			option.NewStringOption(0, "config", "Path to the configuration file.", false, &config.ConfigFilePath),
+			option.NewBoolOption('v', "verbose", "Log at debug level.", false, &config.Verbose),
+		},
+	}
 
-	flag.StringVar(
-		&config.CertificateFilePath,
-		"cert",
-		motmedelEnv.GetEnvWithDefault("CERTIFICATE_FILE_PATH", ""),
-		"Path to TLS certificate file",
-	)
+	if err := parser.Validate(); err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("parser validate: %w", err))
+	}
 
-	flag.StringVar(
-		&config.KeyFilePath,
-		"key",
-		motmedelEnv.GetEnvWithDefault("CERTIFICATE_KEY_PATH", ""),
-		"Path to TLS key file",
-	)
+	if err := parser.Parse(); err != nil {
+		return nil, altshiftErrors.New(fmt.Errorf("parse: %w", err))
+	}
 
-	flag.StringVar(
-		&config.ConfigFilePath,
-		"config",
-		motmedelEnv.GetEnvWithDefault("CONFIG_PATH", "/etc/reverse_proxy/config.json"),
-		"Path to the configuration file",
-	)
-
-	flag.BoolVar(
-		&config.Verbose,
-		"verbose",
-		false,
-		"Enable verbose (debug-level) logging",
-	)
-
-	flag.Parse()
-
-	return config
+	return config, nil
 }
 
 func main() {
-	config := parseFlags()
+	config, err := parseArguments()
+	if err != nil {
+		// Help is an answer to an explicit request, not a failure.
+		if errors.Is(err, argumentParserErrors.ErrHelp) {
+			return
+		}
+
+		fmt.Fprintf(os.Stderr, "%s: %v\n", programName, err)
+		os.Exit(1)
+	}
 
 	logLevel := slog.LevelInfo
 	if config.Verbose {
@@ -130,15 +151,15 @@ func main() {
 	}
 
 	httpContextExtractor := &http_context_extractor.Extractor{}
-	makeLogger := func(eventAttrs ...any) *motmedelErrorLogger.Logger {
-		return &motmedelErrorLogger.Logger{
-			Logger: motmedelContextLogger.New(
+	makeLogger := func(eventAttrs ...any) *altshiftErrorLogger.Logger {
+		return &altshiftErrorLogger.Logger{
+			Logger: altshiftContextLogger.New(
 				slog.NewJSONHandler(
 					os.Stdout,
 					&slog.HandlerOptions{Level: logLevel, ReplaceAttr: schemaLog.ReplaceAttr},
 				),
-				&motmedelLog.ErrorContextExtractor{
-					ContextExtractors: []motmedelLog.ContextExtractor{
+				&altshiftLog.ErrorContextExtractor{
+					ContextExtractors: []altshiftLog.ContextExtractor{
 						httpContextExtractor,
 					},
 				},
@@ -164,7 +185,7 @@ func main() {
 	if serverAddress == "" {
 		logFatal(
 			"Empty server address.",
-			motmedelErrors.NewWithTrace(empty_error.New("server address")),
+			altshiftErrors.NewWithTrace(empty_error.New("server address")),
 		)
 	}
 
@@ -172,7 +193,7 @@ func main() {
 	if certificateFilePath == "" {
 		logFatal(
 			"Empty certificate file path.",
-			motmedelErrors.NewWithTrace(empty_error.New("certificate file path")),
+			altshiftErrors.NewWithTrace(empty_error.New("certificate file path")),
 		)
 	}
 
@@ -180,7 +201,7 @@ func main() {
 	if keyFilePath == "" {
 		logFatal(
 			"Empty key file path.",
-			motmedelErrors.NewWithTrace(empty_error.New("key file path")),
+			altshiftErrors.NewWithTrace(empty_error.New("key file path")),
 		)
 	}
 
@@ -188,7 +209,7 @@ func main() {
 	if configFilePath == "" {
 		logFatal(
 			"Empty config path.",
-			motmedelErrors.NewWithTrace(empty_error.New("config file path")),
+			altshiftErrors.NewWithTrace(empty_error.New("config file path")),
 		)
 	}
 
@@ -198,7 +219,7 @@ func main() {
 	if err != nil {
 		logFatal(
 			"An error occurred when reading the configuration file.",
-			motmedelErrors.NewWithTrace(fmt.Errorf("os read file (config): %w", err)),
+			altshiftErrors.NewWithTrace(fmt.Errorf("os read file (config): %w", err)),
 			configFilePath,
 		)
 	}
@@ -207,7 +228,7 @@ func main() {
 	if err := json.Unmarshal(configData, &hostToUpstreamConfiguration); err != nil {
 		logFatal(
 			"An error occurred when decoding the configuration file.",
-			motmedelErrors.NewWithTrace(fmt.Errorf("json unmarshal (config): %w", err)),
+			altshiftErrors.NewWithTrace(fmt.Errorf("json unmarshal (config): %w", err)),
 			configData,
 		)
 	}
@@ -221,13 +242,13 @@ func main() {
 	if err != nil {
 		logFatal(
 			"An error occurred when reading the certificate file.",
-			motmedelErrors.NewWithTrace(fmt.Errorf("os read file (certificate): %w", err), certificateFilePath),
+			altshiftErrors.NewWithTrace(fmt.Errorf("os read file (certificate): %w", err), certificateFilePath),
 		)
 	}
 	if len(certificateData) == 0 {
 		logFatal(
 			"Empty certificate data.",
-			motmedelErrors.NewWithTrace(empty_error.New("certificate data")),
+			altshiftErrors.NewWithTrace(empty_error.New("certificate data")),
 		)
 	}
 
@@ -235,13 +256,13 @@ func main() {
 	if err != nil {
 		logFatal(
 			"An error occurred when reading the key file.",
-			motmedelErrors.NewWithTrace(fmt.Errorf("os read file (key): %w", err), keyFilePath),
+			altshiftErrors.NewWithTrace(fmt.Errorf("os read file (key): %w", err), keyFilePath),
 		)
 	}
 	if len(keyData) == 0 {
 		logFatal(
 			"Empty key data.",
-			motmedelErrors.NewWithTrace(empty_error.New("key data")),
+			altshiftErrors.NewWithTrace(empty_error.New("key data")),
 		)
 	}
 
@@ -249,27 +270,30 @@ func main() {
 	if err != nil {
 		logFatal(
 			"An error occurred when parsing the certificate and key.",
-			motmedelErrors.NewWithTrace(fmt.Errorf("tls x509 key pair: %w", err)),
+			altshiftErrors.NewWithTrace(fmt.Errorf("tls x509 key pair: %w", err)),
 		)
 	}
 
 	// Make the Vhost mux configuration.
 
-	hostToSpecification := make(map[string]*motmedelMux.VhostMuxSpecification)
+	hostToSpecification := make(map[string]*altshiftMux.VhostMuxSpecification)
+	hostToTlsConfig := make(map[string]*tls.Config)
 
 	for host, upstreamConfiguration := range hostToUpstreamConfiguration {
 		if upstreamConfiguration == nil {
 			logFatal(
 				"Empty upstream configuration.",
-				motmedelErrors.NewWithTrace(nil_error.New("upstream configuration")),
+				altshiftErrors.NewWithTrace(nil_error.New("upstream configuration")),
 			)
+			// logFatal exits; this makes that plain to the reader and the compiler.
+			continue
 		}
 
 		upstreamUrl := upstreamConfiguration.Url
 		if upstreamUrl == "" {
 			logFatal(
 				"Empty upstream URL.",
-				motmedelErrors.NewWithTrace(empty_error.New("upstream url")),
+				altshiftErrors.NewWithTrace(empty_error.New("upstream url")),
 			)
 		}
 
@@ -277,39 +301,98 @@ func main() {
 		if err != nil {
 			logFatal(
 				"An error occurred when parsing an upstream URL.",
-				motmedelErrors.NewWithTrace(fmt.Errorf("url parse: %w", err)),
+				altshiftErrors.NewWithTrace(fmt.Errorf("url parse: %w", err)),
 				upstreamUrl,
 			)
 		}
 
-		var specification *motmedelMux.VhostMuxSpecification
+		// The TLS configuration is settled here rather than per handshake, so a
+		// misconfiguration is a startup failure rather than a runtime one.
+		hostTlsConfig := &tls.Config{Certificates: []tls.Certificate{certificate}}
+
+		if upstreamConfiguration.UseClientAuthentication {
+			clientCaFilePath := upstreamConfiguration.ClientCaFilePath
+			if clientCaFilePath == "" {
+				// Left unset, Go verifies client certificates against the system
+				// roots, which accepts any certificate from any public authority
+				// and so authenticates nothing.
+				logFatal(
+					"Client authentication is enabled without a client CA file.",
+					altshiftErrors.NewWithTrace(empty_error.New("client ca file path")),
+					host,
+				)
+			}
+
+			clientCaData, err := os.ReadFile(clientCaFilePath)
+			if err != nil {
+				logFatal(
+					"An error occurred when reading a client CA file.",
+					altshiftErrors.NewWithTrace(fmt.Errorf("os read file (client ca): %w", err), clientCaFilePath),
+				)
+			}
+
+			clientCaPool := x509.NewCertPool()
+			if !clientCaPool.AppendCertsFromPEM(clientCaData) {
+				logFatal(
+					"No certificates could be read from a client CA file.",
+					altshiftErrors.NewWithTrace(
+						fmt.Errorf("%w: no certificates in client ca file", altshiftErrors.ErrParseError),
+						clientCaFilePath,
+					),
+				)
+			}
+
+			hostTlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+			hostTlsConfig.ClientCAs = clientCaPool
+		}
+
+		hostToTlsConfig[host] = hostTlsConfig
+
+		var specification *altshiftMux.VhostMuxSpecification
 
 		if upstreamConfiguration.Redirect {
-			specification = &motmedelMux.VhostMuxSpecification{RedirectTo: upstreamUrl}
+			specification = &altshiftMux.VhostMuxSpecification{RedirectTo: upstreamUrl}
 		} else {
-			proxy := httputil.NewSingleHostReverseProxy(target)
+			// Rewrite rather than Director: ReverseProxy appends the client
+			// address to X-Forwarded-For itself when a Director is used, which
+			// duplicated the address this already set. Rewrite leaves the header
+			// entirely to this function.
+			proxy := &httputil.ReverseProxy{
+				Rewrite: func(proxyRequest *httputil.ProxyRequest) {
+					if proxyRequest == nil {
+						logError(
+							"Empty proxy request.",
+							altshiftErrors.NewWithTrace(nil_error.New("proxy request")),
+						)
+						return
+					}
 
-			originalDirector := proxy.Director
-			proxy.Director = func(request *http.Request) {
-				if request == nil {
-					logError(
-						"Empty HTTP request.",
-						motmedelErrors.NewWithTrace(motmedelHttpErrors.ErrNilHttpRequest),
-					)
-					return
-				}
+					inbound := proxyRequest.In
+					outbound := proxyRequest.Out
+					if inbound == nil || outbound == nil {
+						logError(
+							"Empty HTTP request.",
+							altshiftErrors.NewWithTrace(nil_error.New("http request")),
+						)
+						return
+					}
 
-				originalDirector(request)
+					proxyRequest.SetURL(target)
+					// SetURL points Host at the upstream. The upstream is addressed
+					// by name here, so the host the client asked for has to be put
+					// back for it to route on.
+					outbound.Host = inbound.Host
 
-				if request.Header == nil {
-					logError(
-						"Empty HTTP request header.",
-						motmedelErrors.NewWithTrace(motmedelHttpErrors.ErrNilHttpRequestHeader),
-					)
-					return
-				}
+					if outbound.Header == nil {
+						logError(
+							"Empty HTTP request header.",
+							altshiftErrors.NewWithTrace(nil_error.New("http request header")),
+						)
+						return
+					}
 
-				setForwardedHeaders(request)
+					setForwardedHeaders(outbound, inbound)
+				},
 			}
 
 			proxyLogger := makeLogger(
@@ -319,18 +402,18 @@ func main() {
 			proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 				proxyLogger.Error(
 					err.Error(),
-					motmedelErrors.NewWithTrace(fmt.Errorf("proxy: %w", err)),
+					altshiftErrors.NewWithTrace(fmt.Errorf("proxy: %w", err)),
 				)
 				w.WriteHeader(http.StatusBadGateway)
 			}
 
-			specification = &motmedelMux.VhostMuxSpecification{Mux: proxy}
+			specification = &altshiftMux.VhostMuxSpecification{Mux: proxy}
 		}
 
 		hostToSpecification[host] = specification
 	}
 
-	vhostMux := &motmedelMux.VhostMux{HostToSpecification: hostToSpecification}
+	vhostMux := &altshiftMux.VhostMux{HostToSpecification: hostToSpecification}
 	if config.Verbose {
 		vhostMux.DoneCallback = func(ctx context.Context) {
 			slog.DebugContext(ctx, "An HTTP response was served.")
@@ -340,30 +423,30 @@ func main() {
 	server := &http.Server{
 		Addr:    serverAddress,
 		Handler: vhostMux,
+		// Without these a client can hold a connection, or a request, open for
+		// as long as it likes. WriteTimeout is left unset: a proxied response
+		// takes as long as its upstream does.
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
 		TLSConfig: &tls.Config{
 			GetConfigForClient: func(clientHelloInfo *tls.ClientHelloInfo) (*tls.Config, error) {
 				if clientHelloInfo == nil {
-					return nil, motmedelErrors.NewWithTrace(nil_error.New("client hello info"))
+					return nil, altshiftErrors.NewWithTrace(nil_error.New("client hello info"))
 				}
 
-				cfg, ok := hostToUpstreamConfiguration[clientHelloInfo.ServerName]
+				serverName := clientHelloInfo.ServerName
+
+				hostTlsConfig, ok := hostToTlsConfig[serverName]
 				if !ok {
 					// Fail the TLS handshake when there is no matching configuration for the server name.
-					return nil, fmt.Errorf("no upstream configuration for SNI %q", clientHelloInfo.ServerName)
+					return nil, altshiftErrors.NewWithTrace(
+						fmt.Errorf("%w: %q", errNoUpstreamConfiguration, serverName),
+						serverName,
+					)
 				}
 
-				if cfg == nil {
-					return nil, motmedelErrors.NewWithTrace(nil_error.New("upstream configuration"))
-				}
-
-				tlsConfig := &tls.Config{Certificates: []tls.Certificate{certificate}}
-
-				if cfg.UseClientAuthentication {
-					tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-					// TODO: I cannot make "CA pinning" work... Something for future?
-				}
-
-				return tlsConfig, nil
+				return hostTlsConfig, nil
 			},
 		},
 	}
@@ -371,7 +454,7 @@ func main() {
 	if err := server.ListenAndServeTLS("", ""); err != nil {
 		logFatal(
 			"An error occurred when listening and serving.",
-			motmedelErrors.NewWithTrace(fmt.Errorf("http listen and serve: %w", err)),
+			altshiftErrors.NewWithTrace(fmt.Errorf("http listen and serve: %w", err)),
 		)
 	}
 }

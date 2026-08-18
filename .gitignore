@@ -2,7 +2,9 @@
 !/.dockerignore
 !/.gitignore
 !/Dockerfile
+!/LICENSE
+!/Makefile
 !/go.mod
 !/go.sum
-!/Makefile
 !/reverse_proxy.go
+!/reverse_proxy_test.go
