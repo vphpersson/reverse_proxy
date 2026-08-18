@@ -133,6 +133,52 @@ func parseArguments() (*CliConfig, error) {
 	return config, nil
 }
 
+// newHostTlsConfig builds the TLS configuration a host is served with. When the
+// host asks for client authentication, the certificates offered are pinned to
+// the configured authority: with ClientCAs left unset Go verifies against the
+// system roots instead, which accepts any certificate issued by any public
+// authority and so authenticates nothing.
+func newHostTlsConfig(
+	certificate tls.Certificate,
+	upstreamConfiguration *UpstreamConfiguration,
+) (*tls.Config, error) {
+	if upstreamConfiguration == nil {
+		return nil, altshiftErrors.NewWithTrace(nil_error.New("upstream configuration"))
+	}
+
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{certificate}}
+
+	if !upstreamConfiguration.UseClientAuthentication {
+		return tlsConfig, nil
+	}
+
+	clientCaFilePath := upstreamConfiguration.ClientCaFilePath
+	if clientCaFilePath == "" {
+		return nil, altshiftErrors.NewWithTrace(empty_error.New("client ca file path"))
+	}
+
+	clientCaData, err := os.ReadFile(clientCaFilePath)
+	if err != nil {
+		return nil, altshiftErrors.NewWithTrace(
+			fmt.Errorf("os read file (client ca): %w", err),
+			clientCaFilePath,
+		)
+	}
+
+	clientCaPool := x509.NewCertPool()
+	if !clientCaPool.AppendCertsFromPEM(clientCaData) {
+		return nil, altshiftErrors.NewWithTrace(
+			fmt.Errorf("%w: no certificates in the client ca file", altshiftErrors.ErrParseError),
+			clientCaFilePath,
+		)
+	}
+
+	tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	tlsConfig.ClientCAs = clientCaPool
+
+	return tlsConfig, nil
+}
+
 func main() {
 	config, err := parseArguments()
 	if err != nil {
@@ -308,42 +354,13 @@ func main() {
 
 		// The TLS configuration is settled here rather than per handshake, so a
 		// misconfiguration is a startup failure rather than a runtime one.
-		hostTlsConfig := &tls.Config{Certificates: []tls.Certificate{certificate}}
-
-		if upstreamConfiguration.UseClientAuthentication {
-			clientCaFilePath := upstreamConfiguration.ClientCaFilePath
-			if clientCaFilePath == "" {
-				// Left unset, Go verifies client certificates against the system
-				// roots, which accepts any certificate from any public authority
-				// and so authenticates nothing.
-				logFatal(
-					"Client authentication is enabled without a client CA file.",
-					altshiftErrors.NewWithTrace(empty_error.New("client ca file path")),
-					host,
-				)
-			}
-
-			clientCaData, err := os.ReadFile(clientCaFilePath)
-			if err != nil {
-				logFatal(
-					"An error occurred when reading a client CA file.",
-					altshiftErrors.NewWithTrace(fmt.Errorf("os read file (client ca): %w", err), clientCaFilePath),
-				)
-			}
-
-			clientCaPool := x509.NewCertPool()
-			if !clientCaPool.AppendCertsFromPEM(clientCaData) {
-				logFatal(
-					"No certificates could be read from a client CA file.",
-					altshiftErrors.NewWithTrace(
-						fmt.Errorf("%w: no certificates in client ca file", altshiftErrors.ErrParseError),
-						clientCaFilePath,
-					),
-				)
-			}
-
-			hostTlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-			hostTlsConfig.ClientCAs = clientCaPool
+		hostTlsConfig, err := newHostTlsConfig(certificate, upstreamConfiguration)
+		if err != nil {
+			logFatal(
+				"An error occurred when building a host TLS configuration.",
+				altshiftErrors.New(fmt.Errorf("new host tls config: %w", err), host),
+			)
+			continue
 		}
 
 		hostToTlsConfig[host] = hostTlsConfig
