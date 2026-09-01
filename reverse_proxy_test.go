@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
-	"sync"
 	"testing"
 	"time"
 )
@@ -291,81 +290,6 @@ func TestUpstreamConfigurationUnmarshal(t *testing.T) {
 
 			if configuration.StreamRequestBody != testCase.expectedStreamRequestBody {
 				t.Errorf("stream_request_body = %v, want %v", configuration.StreamRequestBody, testCase.expectedStreamRequestBody)
-			}
-		})
-	}
-}
-
-// TestNoKeepAliveTransportOpensAFreshConnection counts distinct upstream
-// connections across sequential requests. The pooled default reuses one, which
-// is what races journal-remote's idle close and surfaces as a 502; the returned
-// transport must not.
-func TestNoKeepAliveTransportOpensAFreshConnection(t *testing.T) {
-	t.Parallel()
-
-	const requestCount = 3
-
-	testCases := []struct {
-		name                    string
-		transport               http.RoundTripper
-		expectedConnectionCount int
-	}{
-		{
-			name:                    "no keep alive opens one connection per request",
-			transport:               newNoKeepAliveTransport(),
-			expectedConnectionCount: requestCount,
-		},
-		{
-			name:                    "the pooled default reuses a single connection",
-			transport:               http.DefaultTransport,
-			expectedConnectionCount: 1,
-		},
-	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-
-			var mutex sync.Mutex
-			remoteAddresses := make(map[string]struct{})
-
-			server := httptest.NewServer(http.HandlerFunc(
-				func(_ http.ResponseWriter, request *http.Request) {
-					mutex.Lock()
-					remoteAddresses[request.RemoteAddr] = struct{}{}
-					mutex.Unlock()
-				},
-			))
-			defer server.Close()
-
-			client := &http.Client{Transport: testCase.transport}
-			for range requestCount {
-				request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
-				if err != nil {
-					t.Fatalf("%s: new request: %v", testCase.name, err)
-				}
-
-				response, err := client.Do(request)
-				if err != nil {
-					t.Fatalf("%s: do: %v", testCase.name, err)
-				}
-				// The body must be drained and closed for a pooled connection to
-				// be returned to the pool, or the comparison case proves nothing.
-				if _, err := io.Copy(io.Discard, response.Body); err != nil {
-					t.Fatalf("%s: drain body: %v", testCase.name, err)
-				}
-				if err := response.Body.Close(); err != nil {
-					t.Fatalf("%s: close body: %v", testCase.name, err)
-				}
-			}
-
-			if len(remoteAddresses) != testCase.expectedConnectionCount {
-				t.Errorf(
-					"%s: upstream saw %d distinct connections, want %d",
-					testCase.name,
-					len(remoteAddresses),
-					testCase.expectedConnectionCount,
-				)
 			}
 		})
 	}

@@ -52,40 +52,11 @@ type UpstreamConfiguration struct {
 	// issued by any public authority.
 	ClientCaFilePath string `json:"client_ca_file_path,omitzero"`
 	Redirect         bool   `json:"redirect,omitzero"`
-	// StreamRequestBody marks an upstream whose clients hold a single request
-	// body open indefinitely, which readTimeout cannot express. It clears the
-	// whole-request read deadline for the vhost and stops the proxy pooling
-	// connections to it; see streamRequestBody and newNoKeepAliveTransport.
+	// StreamRequestBody marks an upstream whose clients can hold a request body
+	// open for longer than readTimeout allows, which a whole-request deadline
+	// cannot express. It clears that deadline for the vhost; see
+	// streamRequestBody.
 	StreamRequestBody bool `json:"stream_request_body,omitzero"`
-}
-
-// newNoKeepAliveTransport returns a transport that opens a fresh connection per
-// request instead of drawing on the idle pool.
-//
-// Pooling races the upstream: journal-remote closes idle connections on a timer
-// of its own, so the proxy can take a connection the upstream has already sent
-// FIN on, write to it, and get "use of closed network connection". net/http
-// retries that on a fresh connection only when the request is idempotent or its
-// body can be rewound, and a streamed POST is neither -- so it surfaced as a
-// 502 rather than being recovered.
-//
-// This is paired with StreamRequestBody because it is the same fact about the
-// upstream that motivates both: its clients hold one long-lived, unrewindable
-// request body. There is no reuse to give up when a single request spans hours,
-// and these backends are loopback, so a fresh connection costs nothing worth
-// counting.
-func newNoKeepAliveTransport() http.RoundTripper {
-	// Clone the default rather than build one, so only the pooling behaviour
-	// differs from every other vhost.
-	transport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return &http.Transport{DisableKeepAlives: true}
-	}
-
-	clonedTransport := transport.Clone()
-	clonedTransport.DisableKeepAlives = true
-
-	return clonedTransport
 }
 
 // streamRequestBody returns a handler that clears the server's whole-request
@@ -508,10 +479,6 @@ func main() {
 					altshiftErrors.NewWithTrace(fmt.Errorf("proxy: %w", err)),
 				)
 				w.WriteHeader(http.StatusBadGateway)
-			}
-
-			if upstreamConfiguration.StreamRequestBody {
-				proxy.Transport = newNoKeepAliveTransport()
 			}
 
 			specification = &altshiftMux.VhostMuxSpecification{Mux: proxy}
