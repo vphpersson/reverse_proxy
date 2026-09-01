@@ -3,11 +3,14 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json/v2"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestSetForwardedHeaders(t *testing.T) {
@@ -236,7 +239,8 @@ func TestUpstreamConfigurationUnmarshal(t *testing.T) {
 	const data = `{
 		"a.example": {"url": "http://backend-a:8080"},
 		"b.example": {"url": "https://backend-b", "use_client_authentication": true},
-		"c.example": {"url": "https://elsewhere.example", "redirect": true}
+		"c.example": {"url": "https://elsewhere.example", "redirect": true},
+		"d.example": {"url": "http://backend-d:9090", "stream_request_body": true}
 	}`
 
 	var configurations map[string]*UpstreamConfiguration
@@ -250,10 +254,14 @@ func TestUpstreamConfigurationUnmarshal(t *testing.T) {
 		expectedUrl                  string
 		expectedClientAuthentication bool
 		expectedRedirect             bool
+		expectedStreamRequestBody    bool
 	}{
 		{name: "plain upstream", host: "a.example", expectedUrl: "http://backend-a:8080"},
 		{name: "client authentication", host: "b.example", expectedUrl: "https://backend-b", expectedClientAuthentication: true},
 		{name: "redirect", host: "c.example", expectedUrl: "https://elsewhere.example", expectedRedirect: true},
+		// The tag name is what config.json has to spell; a typo here would
+		// silently leave the upstream on the default timeout and pooling.
+		{name: "stream request body", host: "d.example", expectedUrl: "http://backend-d:9090", expectedStreamRequestBody: true},
 	}
 
 	if len(configurations) != len(testCases) {
@@ -279,6 +287,212 @@ func TestUpstreamConfigurationUnmarshal(t *testing.T) {
 
 			if configuration.Redirect != testCase.expectedRedirect {
 				t.Errorf("redirect = %v, want %v", configuration.Redirect, testCase.expectedRedirect)
+			}
+
+			if configuration.StreamRequestBody != testCase.expectedStreamRequestBody {
+				t.Errorf("stream_request_body = %v, want %v", configuration.StreamRequestBody, testCase.expectedStreamRequestBody)
+			}
+		})
+	}
+}
+
+// TestNoKeepAliveTransportOpensAFreshConnection counts distinct upstream
+// connections across sequential requests. The pooled default reuses one, which
+// is what races journal-remote's idle close and surfaces as a 502; the returned
+// transport must not.
+func TestNoKeepAliveTransportOpensAFreshConnection(t *testing.T) {
+	t.Parallel()
+
+	const requestCount = 3
+
+	testCases := []struct {
+		name                    string
+		transport               http.RoundTripper
+		expectedConnectionCount int
+	}{
+		{
+			name:                    "no keep alive opens one connection per request",
+			transport:               newNoKeepAliveTransport(),
+			expectedConnectionCount: requestCount,
+		},
+		{
+			name:                    "the pooled default reuses a single connection",
+			transport:               http.DefaultTransport,
+			expectedConnectionCount: 1,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var mutex sync.Mutex
+			remoteAddresses := make(map[string]struct{})
+
+			server := httptest.NewServer(http.HandlerFunc(
+				func(_ http.ResponseWriter, request *http.Request) {
+					mutex.Lock()
+					remoteAddresses[request.RemoteAddr] = struct{}{}
+					mutex.Unlock()
+				},
+			))
+			defer server.Close()
+
+			client := &http.Client{Transport: testCase.transport}
+			for range requestCount {
+				request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
+				if err != nil {
+					t.Fatalf("%s: new request: %v", testCase.name, err)
+				}
+
+				response, err := client.Do(request)
+				if err != nil {
+					t.Fatalf("%s: do: %v", testCase.name, err)
+				}
+				// The body must be drained and closed for a pooled connection to
+				// be returned to the pool, or the comparison case proves nothing.
+				if _, err := io.Copy(io.Discard, response.Body); err != nil {
+					t.Fatalf("%s: drain body: %v", testCase.name, err)
+				}
+				if err := response.Body.Close(); err != nil {
+					t.Fatalf("%s: close body: %v", testCase.name, err)
+				}
+			}
+
+			if len(remoteAddresses) != testCase.expectedConnectionCount {
+				t.Errorf(
+					"%s: upstream saw %d distinct connections, want %d",
+					testCase.name,
+					len(remoteAddresses),
+					testCase.expectedConnectionCount,
+				)
+			}
+		})
+	}
+}
+
+// TestStreamRequestBody drives a real server whose ReadTimeout is shorter than
+// the body takes to arrive, which is the shape that cut every journal-upload at
+// 60s. The unconfigured case is what every vhost still gets, so together they
+// pin both halves: the deadline is lifted where it is asked for and nowhere
+// else.
+func TestStreamRequestBody(t *testing.T) {
+	t.Parallel()
+
+	const (
+		serverReadTimeout = 250 * time.Millisecond
+		chunkCount        = 4
+		chunkDelay        = 200 * time.Millisecond
+		chunk             = "0123456789"
+	)
+
+	testCases := []struct {
+		name string
+		// configured makes the request's own host one of streamHosts, as
+		// upload-logs.home.arpa is; otherwise the set names a different host and
+		// the request must keep the deadline the server gave it.
+		configured      bool
+		expectReadError bool
+	}{
+		{
+			name:       "configured host outlives the read timeout",
+			configured: true,
+		},
+		{
+			name:            "unconfigured host keeps the read timeout",
+			expectReadError: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			type readResult struct {
+				byteCount int
+				err       error
+			}
+			readResults := make(chan readResult, 1)
+
+			var handler http.Handler = http.HandlerFunc(
+				func(_ http.ResponseWriter, request *http.Request) {
+					body, err := io.ReadAll(request.Body)
+					readResults <- readResult{byteCount: len(body), err: err}
+				},
+			)
+
+			// httptest serves on a loopback address, so that is the host the
+			// request carries and the one the wrapper has to match on.
+			streamHost := "127.0.0.1"
+			if !testCase.configured {
+				streamHost = "some-other-host.invalid"
+			}
+
+			loggedErrors := make(chan error, 8)
+			handler = streamRequestBody(
+				handler,
+				map[string]struct{}{streamHost: {}},
+				false,
+				func(_ string, err error, _ ...any) { loggedErrors <- err },
+			)
+
+			server := httptest.NewUnstartedServer(handler)
+			server.Config.ReadTimeout = serverReadTimeout
+			server.Start()
+			defer server.Close()
+
+			pipeReader, pipeWriter := io.Pipe()
+			go func() {
+				for range chunkCount {
+					time.Sleep(chunkDelay)
+					if _, err := io.WriteString(pipeWriter, chunk); err != nil {
+						_ = pipeWriter.CloseWithError(err)
+						return
+					}
+				}
+				_ = pipeWriter.Close()
+			}()
+
+			request, err := http.NewRequestWithContext(
+				t.Context(),
+				http.MethodPost,
+				server.URL,
+				pipeReader,
+			)
+			if err != nil {
+				t.Fatalf("%s: new request: %v", testCase.name, err)
+			}
+
+			if response, err := server.Client().Do(request); err == nil {
+				_ = response.Body.Close()
+			}
+
+			select {
+			case result := <-readResults:
+				switch {
+				case testCase.expectReadError && result.err == nil:
+					t.Errorf(
+						"%s: expected a body read error, read %d bytes without one",
+						testCase.name,
+						result.byteCount,
+					)
+				case !testCase.expectReadError && result.err != nil:
+					t.Errorf("%s: unexpected body read error: %v", testCase.name, result.err)
+				case !testCase.expectReadError && result.byteCount != chunkCount*len(chunk):
+					t.Errorf(
+						"%s: read %d bytes, want %d",
+						testCase.name,
+						result.byteCount,
+						chunkCount*len(chunk),
+					)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s: the handler was never reached", testCase.name)
+			}
+
+			close(loggedErrors)
+			for err := range loggedErrors {
+				t.Errorf("%s: clearing the read deadline logged an error: %v", testCase.name, err)
 			}
 		})
 	}

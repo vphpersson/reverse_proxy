@@ -23,6 +23,7 @@ import (
 	"github.com/altshiftab/utils_go/pkg/errors/types/empty_error"
 	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
 	altshiftMux "github.com/altshiftab/utils_go/pkg/http/mux"
+	altshiftForwardedHeaders "github.com/altshiftab/utils_go/pkg/http/mux/types/forwarded_headers"
 	"github.com/altshiftab/utils_go/pkg/http/types/http_context_extractor"
 	altshiftLog "github.com/altshiftab/utils_go/pkg/log"
 	altshiftContextLogger "github.com/altshiftab/utils_go/pkg/log/context_logger"
@@ -51,6 +52,86 @@ type UpstreamConfiguration struct {
 	// issued by any public authority.
 	ClientCaFilePath string `json:"client_ca_file_path,omitzero"`
 	Redirect         bool   `json:"redirect,omitzero"`
+	// StreamRequestBody marks an upstream whose clients hold a single request
+	// body open indefinitely, which readTimeout cannot express. It clears the
+	// whole-request read deadline for the vhost and stops the proxy pooling
+	// connections to it; see streamRequestBody and newNoKeepAliveTransport.
+	StreamRequestBody bool `json:"stream_request_body,omitzero"`
+}
+
+// newNoKeepAliveTransport returns a transport that opens a fresh connection per
+// request instead of drawing on the idle pool.
+//
+// Pooling races the upstream: journal-remote closes idle connections on a timer
+// of its own, so the proxy can take a connection the upstream has already sent
+// FIN on, write to it, and get "use of closed network connection". net/http
+// retries that on a fresh connection only when the request is idempotent or its
+// body can be rewound, and a streamed POST is neither -- so it surfaced as a
+// 502 rather than being recovered.
+//
+// This is paired with StreamRequestBody because it is the same fact about the
+// upstream that motivates both: its clients hold one long-lived, unrewindable
+// request body. There is no reuse to give up when a single request spans hours,
+// and these backends are loopback, so a fresh connection costs nothing worth
+// counting.
+func newNoKeepAliveTransport() http.RoundTripper {
+	// Clone the default rather than build one, so only the pooling behaviour
+	// differs from every other vhost.
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Transport{DisableKeepAlives: true}
+	}
+
+	clonedTransport := transport.Clone()
+	clonedTransport.DisableKeepAlives = true
+
+	return clonedTransport
+}
+
+// streamRequestBody returns a handler that clears the server's whole-request
+// read deadline for the hosts in streamHosts before delegating.
+//
+// http.Server.ReadTimeout bounds reading the entire request, body included, so a
+// client that streams one long-lived body can never satisfy it.
+// systemd-journal-upload does exactly that: it holds a single chunked POST open
+// for as long as it has entries, so the 60s readTimeout cut every upload at 60s
+// on the dot. Because the request never completed, its cursor never advanced and
+// each retry replayed the same backlog from the start -- roughly 2GB/hour of
+// duplicates into journal-remote, whose vacuuming then evicted the other hosts'
+// logs from the retention window.
+//
+// This must wrap the *server's* handler, not an individual vhost's:
+// http.ResponseController reaches the connection by unwrapping the
+// ResponseWriter, and VhostMux hands its specifications a wrapper with no
+// Unwrap method, so from inside a vhost every call fails with "feature not
+// supported" and the deadline silently stays put. Out here the writer is still
+// net/http's own. The host is resolved with the same helper VhostMux routes on
+// so the two cannot disagree about which vhost a request belongs to.
+//
+// Clearing per request keeps ReadTimeout in force for every other vhost.
+func streamRequestBody(
+	handler http.Handler,
+	streamHosts map[string]struct{},
+	trustForwardedHost bool,
+	logError func(string, error, ...any),
+) http.Handler {
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		host := altshiftForwardedHeaders.Host(request, trustForwardedHost)
+
+		if _, ok := streamHosts[host]; ok {
+			if err := http.NewResponseController(responseWriter).SetReadDeadline(time.Time{}); err != nil {
+				// Not fatal: the request is still served, only with the deadline
+				// the server set for it.
+				logError(
+					"An error occurred when clearing the request read deadline.",
+					altshiftErrors.NewWithTrace(fmt.Errorf("response controller set read deadline: %w", err)),
+					host,
+				)
+			}
+		}
+
+		handler.ServeHTTP(responseWriter, request)
+	})
 }
 
 // setForwardedHeaders populates the Forwarded (RFC 7239) and X-Forwarded-*
@@ -324,6 +405,7 @@ func main() {
 
 	hostToSpecification := make(map[string]*altshiftMux.VhostMuxSpecification)
 	hostToTlsConfig := make(map[string]*tls.Config)
+	streamRequestBodyHosts := make(map[string]struct{})
 
 	for host, upstreamConfiguration := range hostToUpstreamConfiguration {
 		if upstreamConfiguration == nil {
@@ -333,6 +415,10 @@ func main() {
 			)
 			// logFatal exits; this makes that plain to the reader and the compiler.
 			continue
+		}
+
+		if upstreamConfiguration.StreamRequestBody {
+			streamRequestBodyHosts[host] = struct{}{}
 		}
 
 		upstreamUrl := upstreamConfiguration.Url
@@ -424,6 +510,10 @@ func main() {
 				w.WriteHeader(http.StatusBadGateway)
 			}
 
+			if upstreamConfiguration.StreamRequestBody {
+				proxy.Transport = newNoKeepAliveTransport()
+			}
+
 			specification = &altshiftMux.VhostMuxSpecification{Mux: proxy}
 		}
 
@@ -437,12 +527,23 @@ func main() {
 		}
 	}
 
+	var rootHandler http.Handler = vhostMux
+	if len(streamRequestBodyHosts) != 0 {
+		rootHandler = streamRequestBody(
+			rootHandler,
+			streamRequestBodyHosts,
+			vhostMux.TrustForwardedHost,
+			logError,
+		)
+	}
+
 	server := &http.Server{
 		Addr:    serverAddress,
-		Handler: vhostMux,
+		Handler: rootHandler,
 		// Without these a client can hold a connection, or a request, open for
 		// as long as it likes. WriteTimeout is left unset: a proxied response
-		// takes as long as its upstream does.
+		// takes as long as its upstream does, and ReadTimeout is lifted per host
+		// by streamRequestBody for an upstream whose clients stream one.
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		IdleTimeout:       idleTimeout,
