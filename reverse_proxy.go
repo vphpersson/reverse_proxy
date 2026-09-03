@@ -57,6 +57,22 @@ type UpstreamConfiguration struct {
 	// cannot express. It clears that deadline for the vhost; see
 	// streamRequestBody.
 	StreamRequestBody bool `json:"stream_request_body,omitzero"`
+	// WriteCommonNames restricts state-changing requests to the client
+	// certificates bearing these common names, leaving reads to every client
+	// UseClientAuthentication admits. Empty means no restriction. It requires
+	// UseClientAuthentication, and is meaningless on a Redirect vhost; both are
+	// startup failures. See authorizeWrites.
+	WriteCommonNames []string `json:"write_common_names,omitzero"`
+	// ClientCommonNames restricts *every* request to the client certificates
+	// bearing these common names, whatever the method. Empty means no
+	// restriction beyond the certificate authority itself.
+	//
+	// This is the field to reach for when a vhost belongs to one machine.
+	// WriteCommonNames cannot express that: it keys off the request method, and
+	// an application that reads with POST -- Kibana searches, for one -- would
+	// be broken by it and still readable by everyone else. Same requirements as
+	// WriteCommonNames. See authorizeClients.
+	ClientCommonNames []string `json:"client_common_names,omitzero"`
 }
 
 // streamRequestBody returns a handler that clears the server's whole-request
@@ -99,6 +115,92 @@ func streamRequestBody(
 					host,
 				)
 			}
+		}
+
+		handler.ServeHTTP(responseWriter, request)
+	})
+}
+
+// permittedCommonName reports whether the request carries a verified client
+// certificate whose common name is in allowed.
+//
+// RequireAndVerifyClientCert guarantees the certificate, so the nil checks are
+// unreachable in a correct configuration; they keep a misconfiguration a
+// refusal rather than a panic.
+func permittedCommonName(request *http.Request, allowed map[string]struct{}) bool {
+	if request == nil || request.TLS == nil || len(request.TLS.PeerCertificates) == 0 {
+		return false
+	}
+
+	_, ok := allowed[request.TLS.PeerCertificates[0].Subject.CommonName]
+	return ok
+}
+
+// commonNameSet indexes common names for lookup.
+func commonNameSet(commonNames []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(commonNames))
+	for _, commonName := range commonNames {
+		set[commonName] = struct{}{}
+	}
+
+	return set
+}
+
+// authorizeClients returns a handler admitting only the client certificates
+// named in allowedCommonNames, regardless of method.
+//
+// Client authentication alone admits every machine the authority ever signed a
+// certificate for, which is the whole fleet. A vhost that belongs to one
+// machine -- Kibana, which fronts every log and the chat archive with no
+// authentication of its own -- needs the narrower rule.
+func authorizeClients(handler http.Handler, allowedCommonNames []string) http.Handler {
+	allowed := commonNameSet(allowedCommonNames)
+
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		if !permittedCommonName(request, allowed) {
+			responseWriter.WriteHeader(http.StatusForbidden)
+			return
+		}
+
+		handler.ServeHTTP(responseWriter, request)
+	})
+}
+
+// safeMethods are the methods authorizeWrites treats as reads. The split is
+// what makes a method rule a usable stand-in for an operation rule: the Docker
+// Registry v2 API pulls with GET and HEAD and pushes with POST, PATCH, PUT and
+// DELETE, so refusing the unsafe methods refuses exactly a push.
+var safeMethods = map[string]struct{}{
+	http.MethodGet:     {},
+	http.MethodHead:    {},
+	http.MethodOptions: {},
+}
+
+// authorizeWrites returns a handler admitting state-changing requests only from
+// the client certificates named in allowedCommonNames, while leaving reads to
+// every client the vhost's client authentication already admitted.
+//
+// Client authentication proves which machine is calling, not what it may do, so
+// on a shared upstream every admitted machine gets that upstream's whole API.
+// The container registry is the case in point: glory has to pull images, but
+// pulling and pushing are the same endpoint set, so a certificate that permits
+// one permits the other -- and an unauthorised push into a registry whose
+// consumers run AutoUpdate=registry is remote code execution on the fleet.
+//
+// The caller must set UseClientAuthentication for the vhost. Without it there
+// is no verified identity to check, and every write here is refused.
+func authorizeWrites(handler http.Handler, allowedCommonNames []string) http.Handler {
+	allowed := commonNameSet(allowedCommonNames)
+
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		if _, ok := safeMethods[request.Method]; ok {
+			handler.ServeHTTP(responseWriter, request)
+			return
+		}
+
+		if !permittedCommonName(request, allowed) {
+			responseWriter.WriteHeader(http.StatusForbidden)
+			return
 		}
 
 		handler.ServeHTTP(responseWriter, request)
@@ -392,6 +494,53 @@ func main() {
 			streamRequestBodyHosts[host] = struct{}{}
 		}
 
+		if len(upstreamConfiguration.ClientCommonNames) != 0 {
+			if !upstreamConfiguration.UseClientAuthentication {
+				logFatal(
+					"Client common names without client authentication.",
+					altshiftErrors.NewWithTrace(
+						fmt.Errorf("%w: client_common_names requires use_client_authentication", altshiftErrors.ErrValidationError),
+					),
+					host,
+				)
+			}
+
+			if upstreamConfiguration.Redirect {
+				logFatal(
+					"Client common names on a redirect.",
+					altshiftErrors.NewWithTrace(
+						fmt.Errorf("%w: client_common_names is meaningless with redirect", altshiftErrors.ErrValidationError),
+					),
+					host,
+				)
+			}
+		}
+
+		if len(upstreamConfiguration.WriteCommonNames) != 0 {
+			// Refusing at startup rather than serving a rule that cannot bind:
+			// without client authentication there is no verified name to match,
+			// and a redirect vhost never reaches an upstream to write to.
+			if !upstreamConfiguration.UseClientAuthentication {
+				logFatal(
+					"Write common names without client authentication.",
+					altshiftErrors.NewWithTrace(
+						fmt.Errorf("%w: write_common_names requires use_client_authentication", altshiftErrors.ErrValidationError),
+					),
+					host,
+				)
+			}
+
+			if upstreamConfiguration.Redirect {
+				logFatal(
+					"Write common names on a redirect.",
+					altshiftErrors.NewWithTrace(
+						fmt.Errorf("%w: write_common_names is meaningless with redirect", altshiftErrors.ErrValidationError),
+					),
+					host,
+				)
+			}
+		}
+
 		upstreamUrl := upstreamConfiguration.Url
 		if upstreamUrl == "" {
 			logFatal(
@@ -481,7 +630,18 @@ func main() {
 				w.WriteHeader(http.StatusBadGateway)
 			}
 
-			specification = &altshiftMux.VhostMuxSpecification{Mux: proxy}
+			var hostHandler http.Handler = proxy
+			if len(upstreamConfiguration.WriteCommonNames) != 0 {
+				hostHandler = authorizeWrites(hostHandler, upstreamConfiguration.WriteCommonNames)
+			}
+
+			// Outermost, so a client excluded from the vhost entirely is refused
+			// before any narrower rule is consulted.
+			if len(upstreamConfiguration.ClientCommonNames) != 0 {
+				hostHandler = authorizeClients(hostHandler, upstreamConfiguration.ClientCommonNames)
+			}
+
+			specification = &altshiftMux.VhostMuxSpecification{Mux: hostHandler}
 		}
 
 		hostToSpecification[host] = specification
